@@ -413,44 +413,71 @@ def run_eda():
             cleaning_steps.append(f"Converted {type_fixes} columns from text to numeric type")
             improvements.append(f"Fixed data types for {type_fixes} columns stored as text but containing numbers")
 
-        # ---- Step 8: OUTLIER DETECTION using IQR ----
-        # Detect and remove statistical outliers from numeric columns
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        outlier_total = 0
+        # ---- Step 8: OUTLIER DETECTION using IQR with ROW DEDUPLICATION ----
+        # Use a unified bitwise OR mask — each row flagged AT MOST ONCE
+        # regardless of how many columns are anomalous.
+        # NaN imputation already happened in Step 3, so nulls won't be falsely flagged.
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        
+        # Filter to valid rows not already in trash
+        valid_mask = ~df.index.isin(trash_indices)
+        
+        # Build unified outlier mask across ALL numeric columns
+        unified_outlier_mask = pd.Series(False, index=df.index)
         outlier_details = []
+        per_col_counts = {}
+        
         for col in numeric_cols:
-            # Only check columns that aren't IDs (skip columns with mostly unique values)
+            # Skip ID-like columns (>90% unique) or binary columns
             unique_ratio = df[col].nunique() / max(len(df), 1)
-            # Skip ID-like columns (every value is unique) or binary columns
             if unique_ratio > 0.9 or df[col].nunique() <= 2:
                 continue
             
-            # Skip columns already handled (not in trash)
-            valid_mask = ~df.index.isin(trash_indices)
             valid_series = df.loc[valid_mask, col].dropna()
-            
             if len(valid_series) < 10:
                 continue
             
-            outlier_mask_valid = detect_outliers_iqr(valid_series)
-            outlier_indices = valid_series[outlier_mask_valid].index.tolist()
+            col_outlier_mask = detect_outliers_iqr(valid_series)
+            col_outlier_indices = valid_series[col_outlier_mask].index
             
-            if outlier_indices:
-                n_outliers = len(outlier_indices)
-                outlier_vals = valid_series[outlier_mask_valid]
+            if len(col_outlier_indices) > 0:
+                outlier_vals = valid_series[col_outlier_mask]
                 min_out = outlier_vals.min()
                 max_out = outlier_vals.max()
+                Q1 = valid_series.quantile(0.25)
+                Q3 = valid_series.quantile(0.75)
                 median_val = valid_series.median()
                 
-                trash_indices.update(outlier_indices)
-                outlier_total += n_outliers
-                outlier_details.append(f"'{col}': {n_outliers} outliers (range {min_out:.0f}–{max_out:.0f}, median={median_val:.0f})")
+                per_col_counts[col] = len(col_outlier_indices)
+                outlier_details.append(
+                    f"'{col}': {len(col_outlier_indices)} outliers "
+                    f"(values {min_out:.0f}–{max_out:.0f}, normal range {Q1:.0f}–{Q3:.0f}, median={median_val:.0f})"
+                )
+                
+                # Bitwise OR — merge into unified mask (row counted once even if anomalous in multiple cols)
+                unified_outlier_mask.loc[col_outlier_indices] = True
         
-        if outlier_total > 0:
-            cleaning_steps.append(f"Detected and removed {outlier_total} statistical outliers: {'; '.join(outlier_details[:5])}")
-            downsides.append(f"Found {outlier_total} extreme outlier values that distort analysis: {'; '.join(outlier_details[:3])}")
-            improvements.append(f"Outliers removed using IQR method (1.5x interquartile range) — these extreme values would skew charts and statistics")
-            anomalies_found.append(f"{outlier_total} statistical outliers in numeric columns")
+        # Apply the unified mask
+        outlier_row_indices = df.index[unified_outlier_mask & valid_mask].tolist()
+        outlier_total_rows = len(outlier_row_indices)
+        outlier_total_flags = sum(per_col_counts.values())  # total per-column flags (for reporting)
+        
+        if outlier_total_rows > 0:
+            trash_indices.update(outlier_row_indices)
+            cleaning_steps.append(
+                f"Detected {outlier_total_rows} anomalous rows "
+                f"({outlier_total_flags} outlier flags across {len(per_col_counts)} columns, deduplicated to {outlier_total_rows} unique rows): "
+                f"{'; '.join(outlier_details[:5])}"
+            )
+            downsides.append(
+                f"Found {outlier_total_rows} rows with extreme outlier values that distort analysis: "
+                f"{'; '.join(outlier_details[:3])}"
+            )
+            improvements.append(
+                f"Outliers removed using IQR method (1.5× interquartile range) with row-level deduplication — "
+                f"{outlier_total_flags} column-level flags consolidated into {outlier_total_rows} unique rows removed"
+            )
+            anomalies_found.append(f"{outlier_total_rows} rows with statistical outliers (across {len(per_col_counts)} numeric columns)")
 
         # Build trash and clean dataframes (preserve column order)
         trash_df = df.loc[list(trash_indices)][original_columns] if trash_indices else pd.DataFrame(columns=original_columns)
@@ -542,7 +569,7 @@ def run_eda():
 # ============================================================
 @app.route('/api/gemini/validate', methods=['POST'])
 def gemini_validate():
-    """Use Gemini to validate the cleaned data."""
+    """Use Gemini to validate the cleaned data with full context."""
     try:
         data = request.json
         summary = data.get('summary', {})
@@ -550,32 +577,52 @@ def gemini_validate():
         clean_rows = data.get('cleanRows', 0)
         trash_rows = data.get('trashRows', 0)
         columns = data.get('columns', [])
+        eda_stats = data.get('edaStats', {})
 
-        prompt = f"""You are a data quality expert. Analyze this data cleaning report and provide a brief validation:
+        # Build stats summary for context
+        stats_summary = []
+        for col, stats in eda_stats.items():
+            if stats.get('type') == 'numeric':
+                stats_summary.append(f"  {col}: min={stats.get('min')}, max={stats.get('max')}, mean={stats.get('mean')}, std={stats.get('std')}")
+            else:
+                stats_summary.append(f"  {col}: {stats.get('unique')} unique values, top='{stats.get('top')}' ({stats.get('topCount')} occurrences)")
 
-Dataset Info:
+        prompt = f"""You are a Senior Data Quality Engineer. Validate this data cleaning report with precision.
+
+DATASET INFO:
 - Columns: {', '.join(columns)}
 - Original rows: {original_rows}
-- Clean rows: {clean_rows}
-- Removed rows: {trash_rows}
-- Cleaning steps: {json.dumps(summary.get('steps', []))}
+- Clean rows after processing: {clean_rows}
+- Rows removed to trash: {trash_rows} ({100*trash_rows/max(original_rows,1):.1f}% of data)
 
-Provide:
-1. Is the cleaning valid and appropriate? (2 sentences max)
-2. Data quality score (out of 10)
-3. One recommendation for analysis
+CLEANING STEPS PERFORMED:
+{json.dumps(summary.get('steps', []), indent=2)}
 
-Keep your response concise (under 100 words)."""
+ANOMALIES FOUND:
+{summary.get('anomalies', 'None reported')}
+
+CLEAN DATA STATISTICS:
+{chr(10).join(stats_summary[:10])}
+
+VALIDATION REQUIREMENTS:
+1. Is the data removal percentage ({100*trash_rows/max(original_rows,1):.1f}%) reasonable? (>30% is concerning)
+2. Were the right cleaning methods used? (IQR for outliers, case normalization, imputation)
+3. Data quality score out of 10 (based on: completeness, consistency, accuracy)
+4. One specific recommendation for downstream analysis
+
+Keep response under 120 words. Be specific, not generic."""
 
         result = ask_gemini(prompt)
         if result:
             return jsonify({'success': True, 'validation': result})
         else:
             # Fallback
-            quality = min(10, max(5, int(10 * clean_rows / max(original_rows, 1))))
+            removal_pct = 100 * trash_rows / max(original_rows, 1)
+            quality = min(10, max(4, int(10 * clean_rows / max(original_rows, 1))))
+            warning = " ⚠️ High removal rate — review trash data for false positives." if removal_pct > 20 else ""
             return jsonify({
                 'success': True,
-                'validation': f"✅ Data cleaning looks valid. Removed {trash_rows} rows ({100*trash_rows/max(original_rows,1):.1f}% of data).\n\n📊 Data Quality Score: {quality}/10\n\n💡 Recommendation: The cleaned dataset with {clean_rows} rows across {len(columns)} columns is ready for dashboard visualization."
+                'validation': f"✅ Data cleaning completed. Removed {trash_rows} rows ({removal_pct:.1f}% of data).{warning}\n\n📊 Data Quality Score: {quality}/10\n\n💡 Recommendation: The cleaned dataset with {clean_rows} rows across {len(columns)} columns is ready for visualization. Verify the trash data tab to confirm removed rows are genuine anomalies."
             })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -645,68 +692,115 @@ Return ONLY the JSON array, nothing else. Example:
 
 @app.route('/api/gemini/insight', methods=['POST'])
 def gemini_insight():
-    """Generate AI insight for a specific chart with data accuracy verification."""
+    """Generate AI insight with structured stats for accuracy verification."""
     try:
         data = request.json
         chart_type = data.get('chartType', 'bar')
         chart_columns = data.get('columns', [])
         chart_data = data.get('data', [])
 
-        # Calculate actual statistics from the data for accuracy
-        total_value = 0
-        max_item = None
-        min_item = None
-        categories = []
-        
+        if not chart_data:
+            return jsonify({'success': True, 'insight': '📊 No data available for insight generation.'})
+
+        # ---- Build structured statistics block for accuracy ----
+        stats_block = {
+            'chart_type': chart_type,
+            'columns': chart_columns,
+            'n_data_points': len(chart_data),
+        }
+
+        # Extract all numeric values per key
+        numeric_keys = {}
         for item in chart_data:
-            # Get the main numeric value
-            val = None
-            for key in item:
-                if key != 'name' and isinstance(item[key], (int, float)):
-                    val = item[key]
-                    break
-            if val is None:
-                val = item.get('value', 0)
-            
-            categories.append(item.get('name', 'N/A'))
-            total_value += val if isinstance(val, (int, float)) else 0
-            
-            if max_item is None or val > (max_item.get('_val', 0)):
-                max_item = {**item, '_val': val}
-            if min_item is None or val < (min_item.get('_val', float('inf'))):
-                min_item = {**item, '_val': val}
+            for key, val in item.items():
+                if key == 'name':
+                    continue
+                if isinstance(val, (int, float)):
+                    if key not in numeric_keys:
+                        numeric_keys[key] = []
+                    numeric_keys[key].append(val)
 
-        prompt = f"""You are a senior data analyst. Analyze this chart data and provide an accurate, verified insight.
+        # Per-key statistics
+        key_stats = {}
+        total_value = 0
+        for key, values in numeric_keys.items():
+            s = pd.Series(values)
+            key_stats[key] = {
+                'count': len(values),
+                'sum': round(float(s.sum()), 2),
+                'mean': round(float(s.mean()), 2),
+                'median': round(float(s.median()), 2),
+                'min': round(float(s.min()), 2),
+                'max': round(float(s.max()), 2),
+                'std': round(float(s.std()), 2) if len(values) > 1 else 0,
+            }
+            total_value += float(s.sum())
 
-Chart type: {chart_type}
-Columns: {', '.join(chart_columns)}
-Number of categories/data points: {len(chart_data)}
-Total value: {total_value:,.0f}
-Data (top 15 entries): {json.dumps(chart_data[:15])}
+        stats_block['value_statistics'] = key_stats
+        stats_block['total_value'] = round(total_value, 2)
 
-ACCURACY RULES (MANDATORY):
-1. VERIFY your numbers against the actual data provided above before writing
-2. Name specific categories and their exact values — do NOT use vague language
-3. Compare the top category to the average ({total_value/max(len(chart_data),1):,.0f} average)
-4. If the data is categorical (text X-axis), mention distribution patterns
-5. If the data is numeric, mention range and any notable gaps
-6. DO NOT make claims about trends the data doesn't support
-7. Keep it to 2-3 sentences maximum
-8. Start with an appropriate emoji"""
+        # Find top and bottom entries
+        main_key = list(numeric_keys.keys())[0] if numeric_keys else 'value'
+        sorted_data = sorted(chart_data, key=lambda x: x.get(main_key, x.get('value', 0)) if isinstance(x.get(main_key, x.get('value', 0)), (int, float)) else 0, reverse=True)
+        
+        stats_block['top_3'] = sorted_data[:3]
+        stats_block['bottom_3'] = sorted_data[-3:]
+        stats_block['average_per_category'] = round(total_value / max(len(chart_data), 1), 2)
+
+        # Correlation if 2+ numeric columns
+        if len(numeric_keys) >= 2:
+            keys_list = list(numeric_keys.keys())
+            try:
+                corr_df = pd.DataFrame({k: numeric_keys[k] for k in keys_list[:3]})
+                stats_block['correlations'] = corr_df.corr().round(4).to_dict()
+            except:
+                pass
+
+        # ---- Expert system prompt ----
+        prompt = f"""You are a Senior Data Scientist conducting a professional EDA review.
+Analyze this chart data and provide an accurate, verified insight.
+
+STATISTICS BLOCK (use these numbers — do NOT guess):
+{json.dumps(stats_block, indent=2)}
+
+FULL DATA ({len(chart_data)} entries):
+{json.dumps(chart_data[:20])}
+
+MANDATORY ACCURACY RULES:
+1. Cross-reference EVERY number you mention against the Statistics Block above
+2. Name the TOP category/value and its EXACT number from the data
+3. Compare it to the average ({stats_block['average_per_category']:,.0f}) — is it above/below and by how much?
+4. Mention the distribution pattern: is it skewed, uniform, or concentrated?
+5. If you see any notable gaps or clusters in the data, mention them
+6. DO NOT invent trends, correlations, or patterns not supported by the data
+7. Keep response to 2-3 sentences maximum
+8. Start with an appropriate emoji
+
+Respond with the insight only, no preamble."""
 
         result = ask_gemini(prompt)
         if result:
             return jsonify({'success': True, 'insight': result.strip()})
         else:
-            # Fallback with accurate stats
-            if chart_data and max_item:
-                max_name = max_item.get('name', 'N/A')
-                max_val = max_item.get('_val', 0)
-                avg_val = total_value / max(len(chart_data), 1)
-                pct_of_total = (max_val / max(total_value, 1)) * 100
+            # Fallback with accurate computed stats
+            if sorted_data:
+                top = sorted_data[0]
+                top_name = top.get('name', 'N/A')
+                top_val = top.get(main_key, top.get('value', 0))
+                avg_val = stats_block['average_per_category']
+                pct_of_total = (top_val / max(total_value, 1)) * 100
+                
+                # Distribution analysis
+                if len(sorted_data) >= 3:
+                    top3_sum = sum(item.get(main_key, item.get('value', 0)) for item in sorted_data[:3] if isinstance(item.get(main_key, item.get('value', 0)), (int, float)))
+                    top3_pct = (top3_sum / max(total_value, 1)) * 100
+                    dist_note = f"Top 3 categories account for {top3_pct:.0f}% of total."
+                else:
+                    dist_note = ""
+                
                 return jsonify({
                     'success': True,
-                    'insight': f'📊 "{max_name}" leads with {max_val:,.0f} ({pct_of_total:.1f}% of total {total_value:,.0f}). Average across {len(chart_data)} categories is {avg_val:,.0f}.'
+                    'insight': f'📊 "{top_name}" leads with {top_val:,.0f} ({pct_of_total:.1f}% of total {total_value:,.0f}), which is {top_val/max(avg_val,1):.1f}× the average of {avg_val:,.0f}. {dist_note}'
                 })
             return jsonify({'success': True, 'insight': '📊 Insufficient data for insight generation.'})
     except Exception as e:

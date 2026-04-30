@@ -212,7 +212,7 @@ export default function DashboardView() {
       const res = await fetch('/api/gemini/insight', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chartType: config.chartType, columns: config.columns, data: data.slice(0, 10) }),
+        body: JSON.stringify({ chartType: config.chartType, columns: config.columns, data: data.slice(0, 30) }),
       });
       const result = await res.json();
       setInsights(prev => ({ ...prev, [idx]: result.insight || result.message || 'No insight available.' }));

@@ -55,6 +55,7 @@ export default function EdaPage() {
               cleanRows: edaData.cleanData.length,
               trashRows: edaData.trashData.length,
               columns,
+              edaStats: edaData.edaStats || {},
             }),
           });
           const gemData = await gemRes.json();
