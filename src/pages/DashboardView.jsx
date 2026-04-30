@@ -363,7 +363,7 @@ export default function DashboardView() {
     }
   };
 
-  // Export to PDF — multi-page support
+  // Export to PDF — single page, sized to fit all content
   const exportPDF = async () => {
     if (!dashRef.current) return;
     const canvas = await html2canvas(dashRef.current, {
@@ -375,26 +375,18 @@ export default function DashboardView() {
       height: dashRef.current.scrollHeight,
     });
     const imgData = canvas.toDataURL('image/png');
-    const pdf = new jsPDF('l', 'mm', 'a4');
-    const pageWidth = pdf.internal.pageSize.getWidth();
-    const pageHeight = pdf.internal.pageSize.getHeight();
-    const imgWidth = pageWidth;
-    const imgHeight = (canvas.height * pageWidth) / canvas.width;
 
-    // If the image fits on one page, just add it
-    if (imgHeight <= pageHeight) {
-      pdf.addImage(imgData, 'PNG', 0, 0, imgWidth, imgHeight);
-    } else {
-      // Multi-page: slice the image across pages
-      let yOffset = 0;
-      let pageNum = 0;
-      while (yOffset < imgHeight) {
-        if (pageNum > 0) pdf.addPage();
-        pdf.addImage(imgData, 'PNG', 0, -yOffset, imgWidth, imgHeight);
-        yOffset += pageHeight;
-        pageNum++;
-      }
-    }
+    // Use landscape A4 width, but calculate height from actual content
+    const pdfWidth = 297; // A4 landscape width in mm
+    const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
+
+    // Create a single custom-sized page that fits everything
+    const pdf = new jsPDF({
+      orientation: pdfWidth > pdfHeight ? 'l' : 'p',
+      unit: 'mm',
+      format: [pdfWidth, pdfHeight],
+    });
+    pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
     pdf.save(`${tableName || 'dashboard'}_export.pdf`);
   };
 
