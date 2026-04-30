@@ -8,7 +8,7 @@ import {
 } from 'recharts';
 import {
   ArrowLeft, PanelLeftClose, PanelLeftOpen, Palette, Columns, BarChart3,
-  Download, Sparkles, TrendingUp, ChevronDown, ChevronUp, FileDown, Plug
+  Download, Sparkles, TrendingUp, ChevronDown, ChevronUp, FileDown, Plug, X
 } from 'lucide-react';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
@@ -232,6 +232,22 @@ export default function DashboardView() {
     setChartConfigs(prev => prev.map((c, i) => i === idx ? { ...c, chartType: newType, chartLabel: newType } : c));
   };
 
+  // Delete a chart from the dashboard
+  const deleteChart = (idx) => {
+    setChartConfigs(prev => prev.filter((_, i) => i !== idx));
+    // Clean up insights for this chart and re-index
+    setInsights(prev => {
+      const newInsights = {};
+      Object.keys(prev).forEach(key => {
+        const k = parseInt(key);
+        if (k < idx) newInsights[k] = prev[key];
+        else if (k > idx) newInsights[k - 1] = prev[key];
+      });
+      return newInsights;
+    });
+    setSelectedChartIdx(null);
+  };
+
   // Render a chart
   const renderChart = (config, idx) => {
     const data = getChartData(config);
@@ -347,19 +363,38 @@ export default function DashboardView() {
     }
   };
 
-  // Export to PDF
+  // Export to PDF — multi-page support
   const exportPDF = async () => {
     if (!dashRef.current) return;
     const canvas = await html2canvas(dashRef.current, {
       backgroundColor: '#0a0a0f',
       scale: 2,
       useCORS: true,
+      scrollY: -window.scrollY,
+      windowHeight: dashRef.current.scrollHeight,
+      height: dashRef.current.scrollHeight,
     });
     const imgData = canvas.toDataURL('image/png');
     const pdf = new jsPDF('l', 'mm', 'a4');
-    const w = pdf.internal.pageSize.getWidth();
-    const h = (canvas.height * w) / canvas.width;
-    pdf.addImage(imgData, 'PNG', 0, 0, w, h);
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const imgWidth = pageWidth;
+    const imgHeight = (canvas.height * pageWidth) / canvas.width;
+
+    // If the image fits on one page, just add it
+    if (imgHeight <= pageHeight) {
+      pdf.addImage(imgData, 'PNG', 0, 0, imgWidth, imgHeight);
+    } else {
+      // Multi-page: slice the image across pages
+      let yOffset = 0;
+      let pageNum = 0;
+      while (yOffset < imgHeight) {
+        if (pageNum > 0) pdf.addPage();
+        pdf.addImage(imgData, 'PNG', 0, -yOffset, imgWidth, imgHeight);
+        yOffset += pageHeight;
+        pageNum++;
+      }
+    }
     pdf.save(`${tableName || 'dashboard'}_export.pdf`);
   };
 
@@ -505,7 +540,7 @@ export default function DashboardView() {
             {kpis.map((kpi, i) => (
               <div key={i} className="kpi-card" style={{ background: theme.kpiBg }}>
                 <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginBottom: '6px', fontWeight: '500' }}>{kpi.label}</div>
-                <div style={{ fontSize: '1.8rem', fontWeight: '800', background: `linear-gradient(135deg, ${theme.colors[0]}, ${theme.colors[1]})`, WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
+                <div style={{ fontSize: '1.8rem', fontWeight: '800', color: theme.colors[0] }}>
                   {kpi.value}
                 </div>
                 {kpi.change && <div style={{ color: 'var(--success)', fontSize: '0.8rem', marginTop: '4px' }}>{kpi.change}</div>}
@@ -516,11 +551,32 @@ export default function DashboardView() {
           {/* Charts Grid */}
           <div style={{ display: 'grid', gridTemplateColumns: `repeat(${dashboardSettings.gridCols}, 1fr)`, gap: '20px' }}>
             {chartConfigs.map((config, idx) => (
-              <div key={idx} className="glass-card" style={{ padding: '20px', overflow: 'hidden' }}>
+              <div key={idx} className="glass-card" style={{ padding: '20px', overflow: 'hidden', position: 'relative' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                   <h3 style={{ fontSize: '0.95rem', fontWeight: '600' }}>
                     {config.chartLabel || config.chartType} — {config.columns.join(', ')}
                   </h3>
+                  <button
+                    onClick={() => deleteChart(idx)}
+                    title="Remove chart"
+                    style={{
+                      background: 'rgba(225, 112, 85, 0.1)',
+                      border: '1px solid rgba(225, 112, 85, 0.25)',
+                      borderRadius: '8px',
+                      color: '#e17055',
+                      cursor: 'pointer',
+                      padding: '5px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      transition: 'all 0.2s ease',
+                      flexShrink: 0,
+                    }}
+                    onMouseOver={e => { e.currentTarget.style.background = 'rgba(225, 112, 85, 0.25)'; }}
+                    onMouseOut={e => { e.currentTarget.style.background = 'rgba(225, 112, 85, 0.1)'; }}
+                  >
+                    <X size={16} />
+                  </button>
                 </div>
 
                 {renderChart(config, idx)}
